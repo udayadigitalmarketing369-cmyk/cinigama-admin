@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   X,
   Upload,
@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Clock,
   AlertTriangle,
+  AlertCircle,
   FileText,
   Trash2,
   Lock,
@@ -30,7 +31,45 @@ import {
   Calendar,
   Save,
   Image as ImageIcon,
+  StopCircle,
+  RotateCw,
+  ChevronDown,
+  ChevronUp,
+  FileWarning,
+  Check,
 } from "lucide-react";
+
+export interface UploadFailureItem {
+  id: string;
+  fileName: string;
+  fileSize: number;
+  batchNumber: number;
+  reason: string;
+  file: File;
+  failedAt: string;
+}
+
+export interface BatchProgressInfo {
+  isActive: boolean;
+  totalFiles: number;
+  totalBatches: number;
+  currentBatchIndex: number;
+  currentBatchFiles: string[];
+  processedFiles: number;
+  successfulCount: number;
+  failedCount: number;
+  percentage: number;
+  statusMessage: string;
+}
+
+function formatBytes(bytes: number, decimals = 1): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
 import {
   EventItem,
   PhotoItem,
@@ -148,11 +187,26 @@ export const ManageEventModal: React.FC<ManageEventModalProps> = ({
   const [isBatchActionLoading, setIsBatchActionLoading] = useState(false);
   const [showUploader, setShowUploader] = useState(false);
 
-  // Bulk Upload State
+  // Bulk Upload State with Batching (groups of 10)
+  const BATCH_SIZE = 10;
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [isPublicUpload, setIsPublicUpload] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadBatchProgress, setUploadBatchProgress] = useState<BatchProgressInfo>({
+    isActive: false,
+    totalFiles: 0,
+    totalBatches: 0,
+    currentBatchIndex: 0,
+    currentBatchFiles: [],
+    processedFiles: 0,
+    successfulCount: 0,
+    failedCount: 0,
+    percentage: 0,
+    statusMessage: "",
+  });
+  const [failedUploads, setFailedUploads] = useState<UploadFailureItem[]>([]);
+  const [showFailedDetails, setShowFailedDetails] = useState(true);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const loadPhotos = useCallback(async () => {
     if (!event) return;
@@ -292,45 +346,222 @@ export const ManageEventModal: React.FC<ManageEventModalProps> = ({
     }
   };
 
-  // Bulk Upload logic
-  const handleBulkUpload = async () => {
-    if (!event || selectedFiles.length === 0) return;
+  // Bulk Upload logic with Batches of 10
+  const handleStopUpload = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  };
+
+  const runBatchUpload = async (filesToUpload: File[]) => {
+    if (!event || filesToUpload.length === 0) return;
+
+    const totalFiles = filesToUpload.length;
+    const totalBatches = Math.ceil(totalFiles / BATCH_SIZE);
+
     setIsUploading(true);
     setErrorMsg("");
-    setUploadProgress(20);
+    setSuccessMsg("");
 
-    try {
-      const timer = setInterval(() => {
-        setUploadProgress((p) => (p < 85 ? p + 15 : p));
-      }, 200);
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
-      const response = await uploadPhotosBulk(
-        event.id,
-        selectedFiles,
-        isPublicUpload,
-        session?.tokens.access_token
-      );
+    let successfulTotal = 0;
+    let failedTotal = 0;
+    const currentRunFailures: UploadFailureItem[] = [];
 
-      clearInterval(timer);
-      setUploadProgress(100);
+    setUploadBatchProgress({
+      isActive: true,
+      totalFiles,
+      totalBatches,
+      currentBatchIndex: 0,
+      currentBatchFiles: [],
+      processedFiles: 0,
+      successfulCount: 0,
+      failedCount: 0,
+      percentage: 0,
+      statusMessage: `Initializing upload of ${totalFiles.toLocaleString()} photo(s) in ${totalBatches.toLocaleString()} batch(es) of ${BATCH_SIZE}...`,
+    });
 
-      if (response.success) {
-        setSuccessMsg(
-          `Uploaded ${response.data.successful} photo(s) successfully (${response.data.failed} failed).`
-        );
-        setSelectedFiles([]);
-        setShowUploader(false);
-        loadPhotos();
-        onRefreshEvents();
-      } else {
-        setErrorMsg(response.message || "Bulk photo upload failed.");
+    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+      if (abortController.signal.aborted) {
+        break;
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setErrorMsg(msg || "Failed to upload photos.");
-    } finally {
-      setIsUploading(false);
+
+      const startIdx = batchIdx * BATCH_SIZE;
+      const endIdx = Math.min(startIdx + BATCH_SIZE, totalFiles);
+      const batchFiles = filesToUpload.slice(startIdx, endIdx);
+
+      setUploadBatchProgress((prev) => ({
+        ...prev,
+        currentBatchIndex: batchIdx + 1,
+        currentBatchFiles: batchFiles.map((f) => f.name),
+        statusMessage: `Uploading batch ${batchIdx + 1} of ${totalBatches} (Photos ${startIdx + 1} - ${endIdx} of ${totalFiles})...`,
+      }));
+
+      try {
+        const response = await uploadPhotosBulk(
+          event.id,
+          batchFiles,
+          isPublicUpload,
+          session?.tokens.access_token,
+          abortController.signal
+        );
+
+        if (response && response.success) {
+          const batchSuccess = response.data?.successful ?? batchFiles.length;
+          const batchFailed = response.data?.failed ?? 0;
+          successfulTotal += batchSuccess;
+
+          if (batchFailed > 0) {
+            failedTotal += batchFailed;
+            const serverErrors: string[] = Array.isArray(response.data?.errors)
+              ? response.data.errors.map(String)
+              : [];
+
+            batchFiles.forEach((file, fIdx) => {
+              const matchedError = serverErrors.find((e) =>
+                e.toLowerCase().includes(file.name.toLowerCase())
+              );
+              const photoRecord = response.data?.photos?.find(
+                (p) => p.original_filename === file.name
+              );
+
+              if (photoRecord?.processing_status === "failed" || matchedError) {
+                currentRunFailures.push({
+                  id: `${file.name}-${batchIdx}-${fIdx}-${Date.now()}`,
+                  fileName: file.name,
+                  fileSize: file.size,
+                  batchNumber: batchIdx + 1,
+                  reason: matchedError || "Server photo processing failed",
+                  file,
+                  failedAt: new Date().toLocaleTimeString(),
+                });
+              } else if (fIdx >= batchSuccess && !photoRecord) {
+                currentRunFailures.push({
+                  id: `${file.name}-${batchIdx}-${fIdx}-${Date.now()}`,
+                  fileName: file.name,
+                  fileSize: file.size,
+                  batchNumber: batchIdx + 1,
+                  reason: serverErrors[fIdx] || "Upload rejected by server",
+                  file,
+                  failedAt: new Date().toLocaleTimeString(),
+                });
+              }
+            });
+          }
+        } else {
+          const failMsg = response?.message || "Batch upload failed on server";
+          failedTotal += batchFiles.length;
+          batchFiles.forEach((file, fIdx) => {
+            currentRunFailures.push({
+              id: `${file.name}-${batchIdx}-${fIdx}-${Date.now()}`,
+              fileName: file.name,
+              fileSize: file.size,
+              batchNumber: batchIdx + 1,
+              reason: failMsg,
+              file,
+              failedAt: new Date().toLocaleTimeString(),
+            });
+          });
+        }
+      } catch (err: unknown) {
+        if (abortController.signal.aborted) {
+          break;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        failedTotal += batchFiles.length;
+        batchFiles.forEach((file, fIdx) => {
+          currentRunFailures.push({
+            id: `${file.name}-${batchIdx}-${fIdx}-${Date.now()}`,
+            fileName: file.name,
+            fileSize: file.size,
+            batchNumber: batchIdx + 1,
+            reason: msg || "Network or server failure",
+            file,
+            failedAt: new Date().toLocaleTimeString(),
+          });
+        });
+      }
+
+      const processedSoFar = endIdx;
+      const percent = Math.round((processedSoFar / totalFiles) * 100);
+
+      setUploadBatchProgress((prev) => ({
+        ...prev,
+        processedFiles: processedSoFar,
+        successfulCount: successfulTotal,
+        failedCount: failedTotal,
+        percentage: percent,
+      }));
+
+      if (currentRunFailures.length > 0) {
+        setFailedUploads((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const added = currentRunFailures.filter((item) => !existingIds.has(item.id));
+          return [...prev, ...added];
+        });
+      }
+
+      // Small 80ms delay between batches for browser event loop & network scheduling
+      await new Promise((resolve) => setTimeout(resolve, 80));
     }
+
+    const wasAborted = abortController.signal.aborted;
+    setIsUploading(false);
+    abortControllerRef.current = null;
+
+    setUploadBatchProgress((prev) => ({
+      ...prev,
+      isActive: false,
+      percentage: wasAborted ? prev.percentage : 100,
+      statusMessage: wasAborted
+        ? `Upload stopped: ${successfulTotal} successful, ${failedTotal} failed.`
+        : `Upload finished: ${successfulTotal} successful, ${failedTotal} failed.`,
+    }));
+
+    if (wasAborted) {
+      setSuccessMsg(
+        `Upload stopped by user. ${successfulTotal} photo(s) uploaded successfully, ${failedTotal} failed.`
+      );
+    } else if (failedTotal === 0) {
+      setSuccessMsg(
+        `Successfully uploaded all ${successfulTotal.toLocaleString()} photo(s) in batches of ${BATCH_SIZE}!`
+      );
+      setSelectedFiles([]);
+    } else {
+      setErrorMsg(
+        `Batch upload finished with ${failedTotal} error(s) out of ${totalFiles}. Detailed error log and retry options are below.`
+      );
+      setSelectedFiles((prev) =>
+        prev.filter((f) => currentRunFailures.some((cf) => cf.fileName === f.name))
+      );
+    }
+
+    loadPhotos();
+    onRefreshEvents();
+  };
+
+  const handleBulkUpload = async () => {
+    if (selectedFiles.length === 0) return;
+    await runBatchUpload(selectedFiles);
+  };
+
+  const handleRetryAllFailed = async () => {
+    if (failedUploads.length === 0) return;
+    const retryFiles = failedUploads.map((item) => item.file);
+    setFailedUploads([]);
+    await runBatchUpload(retryFiles);
+  };
+
+  const handleRetrySingleFailed = async (item: UploadFailureItem) => {
+    setFailedUploads((prev) => prev.filter((p) => p.id !== item.id));
+    await runBatchUpload([item.file]);
+  };
+
+  const handleDismissFailed = () => {
+    setFailedUploads([]);
   };
 
   // ==========================================
@@ -658,7 +889,7 @@ export const ManageEventModal: React.FC<ManageEventModalProps> = ({
                 <div className="flex items-center justify-between">
                   <h4 className="text-xs font-semibold text-white flex items-center gap-2">
                     <Upload className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Bulk Upload Photographs</span>
+                    <span>Bulk Upload Photographs (Batches of 10)</span>
                   </h4>
                   <button
                     onClick={() => setShowUploader(false)}
@@ -669,9 +900,12 @@ export const ManageEventModal: React.FC<ManageEventModalProps> = ({
                 </div>
 
                 <label className="border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-4 flex flex-col items-center justify-center cursor-pointer bg-slate-900/40 hover:bg-slate-900 transition">
-                  <Upload className="w-5 h-5 text-indigo-400 mb-1" />
-                  <span className="text-xs font-medium text-slate-200">
+                  <Upload className="w-6 h-6 text-indigo-400 mb-1.5" />
+                  <span className="text-xs font-semibold text-slate-200">
                     Select photo files to upload
+                  </span>
+                  <span className="text-[11px] text-slate-400 mt-0.5">
+                    Select any quantity (e.g. 100 to 1,000+ photos). Uploads automatically run in batches of 10.
                   </span>
                   <input
                     type="file"
@@ -687,18 +921,36 @@ export const ManageEventModal: React.FC<ManageEventModalProps> = ({
                 </label>
 
                 {selectedFiles.length > 0 && (
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span>{selectedFiles.length} file(s) queued for upload</span>
+                  <div className="p-3 rounded-lg bg-indigo-950/30 border border-indigo-500/20 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-2 text-slate-300">
+                      <Layers className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+                      <div>
+                        <span className="font-semibold text-white">
+                          {selectedFiles.length.toLocaleString()} photo(s) queued
+                        </span>
+                        <span className="text-slate-400 ml-1.5">
+                          ({formatBytes(selectedFiles.reduce((acc, f) => acc + f.size, 0))} total)
+                        </span>
+                        <p className="text-[11px] text-indigo-300/80 mt-0.5">
+                          ⚡ Will be uploaded sequentially in{" "}
+                          <span className="font-semibold text-indigo-200">
+                            {Math.ceil(selectedFiles.length / BATCH_SIZE).toLocaleString()} batch(es)
+                          </span>{" "}
+                          of 10 photos
+                        </p>
+                      </div>
+                    </div>
                     <button
                       onClick={() => setSelectedFiles([])}
-                      className="text-rose-400 hover:underline"
+                      disabled={isUploading}
+                      className="text-rose-400 hover:text-rose-300 font-medium hover:underline disabled:opacity-50"
                     >
-                      Clear
+                      Clear Selection
                     </button>
                   </div>
                 )}
 
-                <div className="flex items-center justify-between pt-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80">
                   <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
                     <input
                       type="checkbox"
@@ -712,25 +964,265 @@ export const ManageEventModal: React.FC<ManageEventModalProps> = ({
                   <button
                     onClick={handleBulkUpload}
                     disabled={selectedFiles.length === 0 || isUploading}
-                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow transition flex items-center gap-2 disabled:opacity-50"
+                    className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow-lg shadow-indigo-600/30 transition flex items-center gap-2 disabled:opacity-50"
                   >
                     {isUploading ? (
-                      <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <>
+                        <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                        <span>
+                          Batch {uploadBatchProgress.currentBatchIndex} / {uploadBatchProgress.totalBatches}
+                        </span>
+                      </>
                     ) : (
                       <>
                         <Upload className="w-3.5 h-3.5" />
-                        <span>Upload {selectedFiles.length} Photos</span>
+                        <span>
+                          Upload {selectedFiles.length > 0 ? `${selectedFiles.length.toLocaleString()} Photos` : "Photos"}
+                          {selectedFiles.length > 0 && ` (${Math.ceil(selectedFiles.length / BATCH_SIZE)} Batches)`}
+                        </span>
                       </>
                     )}
                   </button>
                 </div>
+              </div>
+            )}
 
-                {isUploading && (
-                  <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+            {/* Live Batch Upload Progress Dashboard */}
+            {(isUploading || uploadBatchProgress.processedFiles > 0) && (
+              <div className="p-4 rounded-xl bg-slate-950/90 border border-indigo-500/30 shadow-lg space-y-3 animate-in fade-in duration-150">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5">
+                    {isUploading ? (
+                      <span className="relative flex h-3 w-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-indigo-500" />
+                      </span>
+                    ) : uploadBatchProgress.failedCount === 0 ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 text-amber-400" />
+                    )}
+                    <div>
+                      <h4 className="text-xs font-bold text-white flex items-center gap-2">
+                        <span>Batch Upload Progress</span>
+                        <span className="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold">
+                          Batch {uploadBatchProgress.currentBatchIndex} of {uploadBatchProgress.totalBatches}
+                        </span>
+                      </h4>
+                      <p className="text-[11px] text-slate-400 mt-0.5 font-mono">
+                        {uploadBatchProgress.statusMessage}
+                      </p>
+                    </div>
+                  </div>
+
+                  {isUploading && (
+                    <button
+                      onClick={handleStopUpload}
+                      className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-xs font-semibold flex items-center gap-1.5 transition"
+                    >
+                      <StopCircle className="w-3.5 h-3.5 text-rose-400" />
+                      <span>Stop Upload</span>
+                    </button>
+                  )}
+                </div>
+
+                {/* Progress Bar with Percentage */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">
+                      {uploadBatchProgress.processedFiles.toLocaleString()} /{" "}
+                      {uploadBatchProgress.totalFiles.toLocaleString()} photos processed
+                    </span>
+                    <span className="font-bold text-indigo-300 font-mono">
+                      {uploadBatchProgress.percentage}%
+                    </span>
+                  </div>
+                  <div className="w-full h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
                     <div
-                      className="h-full bg-indigo-500 transition-all duration-300"
-                      style={{ width: `${uploadProgress}%` }}
+                      className={`h-full transition-all duration-300 ${
+                        uploadBatchProgress.failedCount > 0
+                          ? "bg-gradient-to-r from-indigo-500 via-amber-500 to-emerald-500"
+                          : "bg-gradient-to-r from-indigo-500 to-emerald-400"
+                      }`}
+                      style={{ width: `${uploadBatchProgress.percentage}%` }}
                     />
+                  </div>
+                </div>
+
+                {/* 4 Metrics Tiles */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-xs">
+                  <div className="p-2.5 rounded-lg bg-slate-900/70 border border-slate-800 flex flex-col">
+                    <span className="text-[10px] uppercase font-semibold text-slate-400">Total Queued</span>
+                    <span className="text-sm font-bold text-white mt-0.5">
+                      {uploadBatchProgress.totalFiles.toLocaleString()}
+                    </span>
+                    <span className="text-[10px] text-slate-500">
+                      {uploadBatchProgress.totalBatches} batch(es)
+                    </span>
+                  </div>
+
+                  <div className="p-2.5 rounded-lg bg-slate-900/70 border border-slate-800 flex flex-col">
+                    <span className="text-[10px] uppercase font-semibold text-slate-400">Current Batch</span>
+                    <span className="text-sm font-bold text-indigo-300 mt-0.5 font-mono">
+                      {uploadBatchProgress.currentBatchIndex} / {uploadBatchProgress.totalBatches}
+                    </span>
+                    <span className="text-[10px] text-indigo-400/80">
+                      {uploadBatchProgress.currentBatchIndex > 0
+                        ? `Photos ${((uploadBatchProgress.currentBatchIndex - 1) * BATCH_SIZE) + 1} - ${Math.min(
+                            uploadBatchProgress.currentBatchIndex * BATCH_SIZE,
+                            uploadBatchProgress.totalFiles
+                          )}`
+                        : "Ready"}
+                    </span>
+                  </div>
+
+                  <div className="p-2.5 rounded-lg bg-emerald-950/20 border border-emerald-900/30 flex flex-col">
+                    <span className="text-[10px] uppercase font-semibold text-emerald-400 flex items-center gap-1">
+                      <CheckCircle2 className="w-2.5 h-2.5" /> Successful
+                    </span>
+                    <span className="text-sm font-bold text-emerald-300 mt-0.5 font-mono">
+                      {uploadBatchProgress.successfulCount.toLocaleString()}
+                    </span>
+                    <span className="text-[10px] text-emerald-500/80">
+                      {uploadBatchProgress.totalFiles > 0
+                        ? `${Math.round((uploadBatchProgress.successfulCount / uploadBatchProgress.totalFiles) * 100)}% of total`
+                        : "0%"}
+                    </span>
+                  </div>
+
+                  <div className="p-2.5 rounded-lg bg-rose-950/20 border border-rose-900/30 flex flex-col">
+                    <span className="text-[10px] uppercase font-semibold text-rose-400 flex items-center gap-1">
+                      <AlertCircle className="w-2.5 h-2.5" /> Failed
+                    </span>
+                    <span className="text-sm font-bold text-rose-300 mt-0.5 font-mono">
+                      {uploadBatchProgress.failedCount.toLocaleString()}
+                    </span>
+                    <span className="text-[10px] text-rose-500/80">
+                      {uploadBatchProgress.failedCount > 0 ? "Review errors below" : "None"}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Active in-flight files list */}
+                {isUploading && uploadBatchProgress.currentBatchFiles.length > 0 && (
+                  <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800">
+                    <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1.5">
+                      <span className="flex items-center gap-1.5 font-semibold text-slate-300">
+                        <Upload className="w-3 h-3 text-indigo-400 animate-pulse" />
+                        Transmitting Batch #{uploadBatchProgress.currentBatchIndex} (
+                        {uploadBatchProgress.currentBatchFiles.length} photos):
+                      </span>
+                      <span className="text-[10px] text-slate-500">10 photos / batch</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto pr-1">
+                      {uploadBatchProgress.currentBatchFiles.map((fileName, idx) => (
+                        <span
+                          key={idx}
+                          className="text-[10px] px-2 py-0.5 rounded bg-slate-800/90 text-slate-300 border border-slate-700/60 truncate max-w-[190px] flex items-center gap-1"
+                          title={fileName}
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse flex-shrink-0" />
+                          <span className="truncate">{fileName}</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Detailed Failed Uploads Section & Retry Toolbar */}
+            {failedUploads.length > 0 && (
+              <div className="p-4 rounded-xl bg-rose-950/20 border border-rose-500/40 space-y-3 shadow-lg animate-in fade-in duration-150">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+                    <div>
+                      <h4 className="text-xs font-bold text-rose-200 flex items-center gap-2">
+                        <span>{failedUploads.length.toLocaleString()} Photo(s) Failed to Upload</span>
+                        <span className="text-[10px] px-2 py-0.2 rounded-full bg-rose-500/20 border border-rose-500/30 text-rose-300 font-mono">
+                          Action Required
+                        </span>
+                      </h4>
+                      <p className="text-[11px] text-rose-300/80">
+                        Review individual failure reasons below or retry all failed photos in batches of 10.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleRetryAllFailed}
+                      disabled={isUploading}
+                      className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-md shadow-rose-900/30 transition disabled:opacity-50"
+                    >
+                      <RotateCw className={`w-3.5 h-3.5 ${isUploading ? "animate-spin" : ""}`} />
+                      <span>Retry All Failed ({failedUploads.length})</span>
+                    </button>
+
+                    <button
+                      onClick={() => setShowFailedDetails(!showFailedDetails)}
+                      className="p-1.5 rounded-lg bg-slate-900 border border-rose-900/40 text-rose-300 hover:text-white transition"
+                      title={showFailedDetails ? "Collapse error list" : "Expand error list"}
+                    >
+                      {showFailedDetails ? (
+                        <ChevronUp className="w-3.5 h-3.5" />
+                      ) : (
+                        <ChevronDown className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+
+                    <button
+                      onClick={handleDismissFailed}
+                      disabled={isUploading}
+                      className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white transition disabled:opacity-50"
+                      title="Dismiss failed photos list"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Collapsible list of failed photos */}
+                {showFailedDetails && (
+                  <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1 text-xs">
+                    {failedUploads.map((item) => (
+                      <div
+                        key={item.id}
+                        className="p-2.5 rounded-lg bg-slate-900/90 border border-rose-900/50 flex items-center justify-between gap-3 hover:border-rose-500/40 transition"
+                      >
+                        <div className="flex items-start gap-2.5 min-w-0">
+                          <FileWarning className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-semibold text-slate-200 truncate max-w-[240px]">
+                                {item.fileName}
+                              </span>
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono">
+                                {formatBytes(item.fileSize)}
+                              </span>
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-950 text-rose-300 border border-rose-800/40 font-mono">
+                                Batch #{item.batchNumber}
+                              </span>
+                              <span className="text-[10px] text-slate-500">{item.failedAt}</span>
+                            </div>
+                            <p className="text-[11px] text-rose-300/90 mt-1 font-mono break-all bg-rose-950/40 p-1 rounded border border-rose-900/30">
+                              {item.reason}
+                            </p>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => handleRetrySingleFailed(item)}
+                          disabled={isUploading}
+                          className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 text-[11px] font-medium flex items-center gap-1 transition flex-shrink-0 disabled:opacity-50"
+                          title="Retry uploading this single photo"
+                        >
+                          <RotateCw className="w-3 h-3 text-indigo-400" />
+                          <span>Retry</span>
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>

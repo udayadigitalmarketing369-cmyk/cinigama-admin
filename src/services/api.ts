@@ -204,7 +204,8 @@ export async function uploadPhotosBulk(
   eventId: string,
   files: File[],
   isPublic: boolean,
-  token?: string
+  token?: string,
+  signal?: AbortSignal
 ): Promise<BulkUploadResponse> {
   const baseUrl = getStoredApiBaseUrl();
   const url = `${baseUrl}/api/v1/events/${eventId}/photos/bulk`;
@@ -224,6 +225,7 @@ export async function uploadPhotosBulk(
     method: "POST",
     headers,
     body: formData,
+    signal,
   });
 
   return handleResponse<BulkUploadResponse>(res);
