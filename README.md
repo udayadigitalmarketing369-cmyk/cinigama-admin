@@ -1,4 +1,6 @@
-# cinigama-admin — Event Photo Finder & Organiser Portal
+# cinigama-admin
+
+Event Photo Finder & Organiser Portal
 
 A modern React application built with TypeScript, Tailwind CSS, and Next.js implementing all features specified in the API reference:
 1. **Browse All Events**: Explore public and private events with real-time search, access filters, and photo counters.
@@ -115,4 +117,4 @@ event-photo-finder/
 | `/api/v1/events/:id/photos/:photoId/view` | `GET` | Delivers full-resolution photo with session token |
 | `/api/v1/events/:id/photos/:photoId/thumbnail` | `GET` | Delivers thumbnail image |
 
-# cinigama-admin
+# cinigama-backend
